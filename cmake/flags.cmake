@@ -21,13 +21,12 @@ function(CheckCompilerCXX11Flag)
             if (${CMAKE_CXX_COMPILER_VERSION} VERSION_LESS 3.3)
                 message(FATAL_ERROR "Unsupported Clang version. Clang >= 3.3 required.")
             endif()
-        endif()   
+        endif()
     endif()
 endfunction()
 
 CheckCompilerCXX11Flag()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
-
 # safe_set_flag
 #
 # Set a compile flag only if compiler is support
@@ -38,6 +37,12 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 function(safe_set_flag is_c src_list flag_name)
     string(REPLACE "-" "_" safe_name ${flag_name})
     string(REPLACE "=" "_" safe_name ${safe_name})
+
+    if(${flag_name} MATCHES "fsanitize")
+        set(CMAKE_REQUIRED_FLAGS_RETAINED ${CMAKE_REQUIRED_FLAGS})
+        set(CMAKE_REQUIRED_FLAGS ${flag_name})
+    endif()
+
     if(is_c)
         CHECK_C_COMPILER_FLAG(${flag_name} C_COMPILER_SUPPORT_FLAG_${safe_name})
         set(safe_name C_COMPILER_SUPPORT_FLAG_${safe_name})
@@ -47,6 +52,10 @@ function(safe_set_flag is_c src_list flag_name)
     endif()
     if(${safe_name})
         set(${src_list} "${${src_list}} ${flag_name}" PARENT_SCOPE)
+    endif()
+
+    if(${flag_name} MATCHES "fsanitize")
+        set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_RETAINED})
     endif()
 endfunction()
 
@@ -67,10 +76,24 @@ macro(safe_set_nvflag flag_name)
     CHECK_C_COMPILER_FLAG(${flag_name} C_COMPILER_SUPPORT_FLAG_${safe_name})
     set(safe_name C_COMPILER_SUPPORT_FLAG_${safe_name})
     if(${safe_name})
-        LIST(APPEND CUDA_NVCC_FLAGS -Xcompiler ${flag_name})
+        set(SAFE_GPU_COMMON_FLAGS "${SAFE_GPU_COMMON_FLAGS} -Xcompiler=\"${flag_name}\"")
     endif()
 endmacro()
 
+macro(safe_set_static_flag) # set c_flags and cxx_flags to static or shared
+    if (BUILD_SHARED_LIBS) 
+        return() # if build shared libs, the flags keep same with '/MD'
+    endif(BUILD_SHARED_LIBS)
+    foreach(flag_var
+        CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
+        CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO
+        CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
+        CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO)
+      if(${flag_var} MATCHES "/MD")
+        string(REGEX REPLACE "/MD" "/MT" ${flag_var} "${${flag_var}}")
+      endif(${flag_var} MATCHES "/MD")
+    endforeach(flag_var)
+endmacro()
 
 CHECK_CXX_SYMBOL_EXISTS(UINT64_MAX "stdint.h" UINT64_MAX_EXISTS)
 if(NOT UINT64_MAX_EXISTS)
@@ -95,21 +118,62 @@ if(BARRIER_FOUND)
 endif(BARRIER_FOUND)
 SET(CMAKE_EXTRA_INCLUDE_FILES "")
 
+# Only one sanitizer is allowed in compile time
+string(TOLOWER "${SANITIZER_TYPE}" sanitizer_type)
+if(sanitizer_type STREQUAL "address")
+    set(fsanitize "-fsanitize=address")
+elseif(sanitizer_type STREQUAL "leak")
+    set(fsanitize "-fsanitize=leak")
+elseif(sanitizer_type STREQUAL "memory")
+    set(fsanitize "-fsanitize=memory")
+elseif(sanitizer_type STREQUAL "thread")
+    set(fsanitize "-fsanitize=thread")
+elseif(sanitizer_type STREQUAL "undefined")
+    set(fsanitize "-fsanitize=undefined")
+endif()
+
 # Common flags. the compiler flag used for C/C++ sources whenever release or debug
 # Do not care if this flag is support for gcc.
+
+# https://github.com/PaddlePaddle/Paddle/issues/12773
+if (NOT WIN32)
 set(COMMON_FLAGS
     -fPIC
     -fno-omit-frame-pointer
+    -Werror
     -Wall
     -Wextra
-    -Werror
     -Wnon-virtual-dtor
     -Wdelete-non-virtual-dtor
     -Wno-unused-parameter
     -Wno-unused-function
     -Wno-error=literal-suffix
-    -Wno-error=sign-compare
-    -Wno-error=unused-local-typedefs)
+    -Wno-error=unused-local-typedefs
+    -Wno-error=parentheses-equality # Warnings in pybind11
+    -Wno-error=ignored-attributes  # Warnings in Eigen, gcc 6.3
+    -Wno-error=terminate  # Warning in PADDLE_ENFORCE
+    -Wno-error=int-in-bool-context # Warning in Eigen gcc 7.2
+    -Wimplicit-fallthrough=0 # Warning in tinyformat.h
+    -Wno-error=maybe-uninitialized # Warning in boost gcc 7.2
+    ${fsanitize}
+)
+
+if(NOT APPLE)
+    if(${CMAKE_CXX_COMPILER_VERSION} VERSION_GREATER 8.0)
+        set(COMMON_FLAGS
+                ${COMMON_FLAGS}
+                -Wno-format-truncation # Warning in boost gcc 8.2
+                -Wno-error=cast-function-type # Warning in boost gcc 8.2
+                -Wno-error=parentheses # Warning in boost gcc 8.2
+                -Wno-error=catch-value # Warning in boost gcc 8.2
+                -Wno-error=nonnull-compare # Warning in boost gcc 8.2
+                -Wno-error=address # Warning in boost gcc 8.2
+                -Wno-ignored-qualifiers # Warning in boost gcc 8.2
+                -Wno-ignored-attributes # Warning in Eigen gcc 8.3
+                -Wno-parentheses # Warning in Eigen gcc 8.3
+                )
+    endif()
+endif(NOT APPLE)
 
 set(GPU_COMMON_FLAGS
     -fPIC
@@ -118,83 +182,55 @@ set(GPU_COMMON_FLAGS
     -Wdelete-non-virtual-dtor
     -Wno-unused-parameter
     -Wno-unused-function
-    -Wno-error=sign-compare
     -Wno-error=literal-suffix
     -Wno-error=unused-local-typedefs
     -Wno-error=unused-function  # Warnings in Numpy Header.
+    -Wno-error=array-bounds # Warnings in Eigen::array
 )
+if (NOT WITH_NV_JETSON AND NOT WITH_ARM)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64")
+endif()
+endif(NOT WIN32)
 
 if (APPLE)
     # On Mac OS X build fat binaries with x86_64 architectures by default.
     set (CMAKE_OSX_ARCHITECTURES "x86_64" CACHE STRING "Build architectures for OSX" FORCE)
-else()
+    # On Mac OS X register class specifier is deprecated and will cause warning error on latest clang 10.0
+    set (COMMON_FLAGS -Wno-deprecated-register)
+endif(APPLE)
+
+if(LINUX)
     set(GPU_COMMON_FLAGS
         -Wall
         -Wextra
         -Werror
         ${GPU_COMMON_FLAGS})
-endif()
-
+endif(LINUX)
 
 foreach(flag ${COMMON_FLAGS})
     safe_set_cflag(CMAKE_C_FLAGS ${flag})
     safe_set_cxxflag(CMAKE_CXX_FLAGS ${flag})
 endforeach()
 
+set(SAFE_GPU_COMMON_FLAGS "")
 foreach(flag ${GPU_COMMON_FLAGS})
     safe_set_nvflag(${flag})
 endforeach()
 
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${SAFE_GPU_COMMON_FLAGS}")
 
-set(CUDA_PROPAGATE_HOST_FLAGS OFF)
 
-# Release/Debug flags set by cmake. Such as -O3 -g -DNDEBUG etc.
-# So, don't set these flags here.
-LIST(APPEND CUDA_NVCC_FLAGS -std=c++11)
-LIST(APPEND CUDA_NVCC_FLAGS --use_fast_math)
-
-if(CMAKE_BUILD_TYPE  STREQUAL "Debug")
-    LIST(APPEND CUDA_NVCC_FLAGS  ${CMAKE_CXX_FLAGS_DEBUG})
-elseif(CMAKE_BUILD_TYPE  STREQUAL "Release")
-    LIST(APPEND CUDA_NVCC_FLAGS  ${CMAKE_CXX_FLAGS_RELEASE})
-elseif(CMAKE_BUILD_TYPE  STREQUAL "RelWithDebInfo")
-    LIST(APPEND CUDA_NVCC_FLAGS  ${CMAKE_CXX_FLAGS_RELWITHDEBINFO})
-elseif(CMAKE_BUILD_TYPE  STREQUAL "MinSizeRel")
-    LIST(APPEND CUDA_NVCC_FLAGS  ${CMAKE_CXX_FLAGS_MINSIZEREL})
-endif()
-
-function(specify_cuda_arch cuda_version cuda_arch)
-    if(${cuda_version} VERSION_GREATER "8.0")
-        foreach(capability 61 62)
-          if(${cuda_arch} STREQUAL ${capability})
-            list(APPEND __arch_flags " -gencode arch=compute_${cuda_arch},code=sm_${cuda_arch}")
-          endif()
-        endforeach()
-    elseif(${cuda_version} VERSION_GREATER "7.0" and ${cuda_arch} STREQUAL "53")
-        list(APPEND __arch_flags " -gencode arch=compute_${cuda_arch},code=sm_${cuda_arch}")
+if(WIN32)
+    # windows build turn off warnings.
+    if(MSVC_STATIC_CRT)
+        safe_set_static_flag()
     endif()
-endfunction()
-
-# Common gpu architectures: Kepler, Maxwell
-foreach(capability 30 35 50)
-      list(APPEND __arch_flags " -gencode arch=compute_${capability},code=sm_${capability}")
-endforeach()
-
-if (CUDA_VERSION VERSION_GREATER "7.0" OR CUDA_VERSION VERSION_EQUAL "7.0")
-      list(APPEND __arch_flags " -gencode arch=compute_52,code=sm_52")
+    foreach(flag_var
+        CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
+        CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO
+        CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
+        CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO)
+        string(REGEX REPLACE "(^| )/W[0-9]( |$)" " " ${flag_var} "${${flag_var}}")
+        set(flag_var "${flag_var} /w")
+    endforeach(flag_var)
 endif()
-
-# Modern gpu architectures: Pascal
-if (CUDA_VERSION VERSION_GREATER "8.0" OR CUDA_VERSION VERSION_EQUAL "8.0")
-      list(APPEND __arch_flags " -gencode arch=compute_60,code=sm_60")
-endif()
-
-# Custom gpu architecture
-set(CUDA_ARCH)
-
-if(CUDA_ARCH)
-  specify_cuda_arch(${CUDA_VERSION} ${CUDA_ARCH})
-endif()
-
-set(CUDA_NVCC_FLAGS ${__arch_flags} ${CUDA_NVCC_FLAGS})
-

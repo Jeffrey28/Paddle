@@ -1,20 +1,4 @@
-add_subdirectory(cuda)
-add_subdirectory(function)
-add_subdirectory(utils)
-add_subdirectory(testing)
-add_subdirectory(math)
-add_subdirectory(parameter)
-add_subdirectory(gserver)
-add_subdirectory(pserver)
-add_subdirectory(trainer)
 add_subdirectory(scripts)
-
-if(WITH_C_API)
-    add_subdirectory(capi)
-endif()
-
-if(WITH_SWIG_PY)
-  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/setup.py.in
-          ${CMAKE_CURRENT_SOURCE_DIR}/setup.py)
-  add_subdirectory(api)
-endif()
+add_subdirectory(testing)
+set(PYTHON_TESTS_DIR ${PADDLE_BINARY_DIR}/python/paddle/fluid/tests CACHE INTERNAL "python tests directory")
+add_subdirectory(fluid)
